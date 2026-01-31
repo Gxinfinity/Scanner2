@@ -21,22 +21,19 @@ PROGRESS_STEP = 5
 COMMON_PORTS = [21, 22, 80, 443, 3306, 8080]
 
 def create_session():
-    """Fix: Session per-scan for thread-safety"""
+    """Create unique session per scan for safety"""
     s = requests.Session()
     s.headers.update(HEADERS)
     return s
 
 async def resolve_dns_smart(domain, loop):
-    """Fix: Robust DNS resolve with IPv4 preference for port scans"""
+    """Robust DNS resolve with IPv4 preference"""
     try:
         addr_info = await loop.run_in_executor(None, socket.getaddrinfo, domain, None)
-        # Prefer IPv4 (AF_INET) for better socket compatibility
         for fam, _, _, _, sockaddr in addr_info:
-            if fam == socket.AF_INET:
-                return sockaddr[0]
+            if fam == socket.AF_INET: return sockaddr[0]
         return addr_info[0][4][0] 
-    except:
-        return None
+    except: return None
 # =========================================
 
 # ============== UTILS & TOOLS ==============
@@ -50,20 +47,18 @@ def find_subdomains(domain, session):
         r = session.get(f"https://crt.sh/?q={domain}&output=json", timeout=15)
         if r.status_code == 200:
             try:
-                data = r.json() # ValueError handle
+                data = r.json()
                 for entry in data:
                     name = entry['name_value']
                     for n in name.split("\n"):
                         n = n.strip()
-                        # Filter wildcards
-                        if "*" not in n and n.endswith(domain):
-                            subs.add(n)
+                        if "*" not in n and n.endswith(domain): subs.add(n)
             except ValueError: return [] 
     except: pass
     return sorted(list(subs))
 
 def scan_ports_fast(host_ip):
-    # Cloudflare detection
+    # CF/CDN Detection logic
     CF_RANGES = ("104.16.", "104.17.", "104.18.", "104.19.", "172.64.", "172.67.")
     if host_ip.startswith(CF_RANGES): return "CF_DETECTED"
 
@@ -71,7 +66,7 @@ def scan_ports_fast(host_ip):
     def check_port(p):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(2) # Balanced timeout
+                s.settimeout(2)
                 if s.connect_ex((host_ip, p)) == 0: return p
         except: return None
 
@@ -85,14 +80,13 @@ def indicator_scan(html):
     low_html = html.lower()
     if any(p in low_html for p in ["sql syntax", "mysql_fetch", "sqlite3"]):
         findings.append("Potential SQLi Error")
-    # Low noise XSS detection
-    if "onerror=" in low_html and "<img" in low_html:
+    if "onerror=" in low_html and "<img" in low_html: # Refined XSS logic
         findings.append("Potential XSS Indicator")
     return findings
 
 # ============== CORE LOGIC ==============
 async def run_full_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("scanning"): # Scan Lock
+    if context.user_data.get("scanning"): 
         await context.bot.send_message(chat_id=update.effective_chat.id, text="⏳ Scan already running!")
         return
     
@@ -106,10 +100,9 @@ async def run_full_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_running_loop() 
 
     try:
-        # IP Resolution
         ip = await resolve_dns_smart(domain, loop)
         if not ip:
-            await msg.edit_text("❌ DNS Resolve failed. Target might be offline.")
+            await msg.edit_text("❌ DNS Resolve failed.")
             return
 
         await msg.edit_text("🌐 Harvesting Subdomains...")
@@ -118,7 +111,7 @@ async def run_full_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🔌 Scanning Ports...")
         ports_result = await loop.run_in_executor(None, scan_ports_fast, ip)
         
-        # Proper Robots.txt check
+        # Real Robots.txt check
         robots_url = urljoin(target, "/robots.txt")
         try:
             robots_res = await loop.run_in_executor(None, lambda: session.get(robots_url, timeout=5))
@@ -129,11 +122,9 @@ async def run_full_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         visited, results, queue = set(), [], [target]
         
         while queue and len(visited) < MAX_PAGES:
-            # Absolute queue safety
             if len(queue) > 200: break 
-            
             url = queue.pop(0)
-            if url.count("/") > target.count("/") + 5: continue # Depth safety
+            if url.count("/") > target.count("/") + 5: continue
             
             base_url = url.split("?")[0].rstrip("/") 
             if base_url in visited or urlparse(url).netloc != domain: continue
@@ -142,52 +133,40 @@ async def run_full_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 r = await loop.run_in_executor(None, lambda: session.get(url, timeout=8))
                 vulns = indicator_scan(r.text)
+                if has_robots and url == target: vulns.append("Robots.txt Accessible")
                 
                 soup = BeautifulSoup(r.text, "html.parser")
                 for a in soup.find_all("a", href=True):
                     clean_link = urljoin(url, a["href"]).split("#")[0]
                     if clean_link not in visited and clean_link not in queue:
-                        if urlparse(clean_link).netloc == domain:
-                            queue.append(clean_link)
-                
+                        if urlparse(clean_link).netloc == domain: queue.append(clean_link)
                 results.append({"url": url, "status": r.status_code, "vulns": vulns})
             except: continue
 
-            # Flood protection
             if len(visited) % PROGRESS_STEP == 0:
-                await msg.edit_text(f"🔍 Analyzed {len(visited)} pages...")
+                await msg.edit_text(f"🔍 Progress: {len(visited)} pages analyzed...")
 
         duration = round(time.time() - start_time, 2)
-        context.user_data["scan_data"] = {
-            "results": results, "subdomains": subdomains, 
-            "ports": ports_result, "time": duration, "robots": has_robots
-        }
+        context.user_data["scan_data"] = {"results": results, "subdomains": subdomains, "ports": ports_result, "time": duration, "robots": has_robots}
         context.user_data["ready"] = True
         
-        port_msg = "Cloudflare (Skip)" if ports_result == "CF_DETECTED" else f"{len(ports_result)} Open"
-        # Summary with robots.txt status
-        summary = (f"✅ **Elite Scan Complete!**\nTime: {duration}s\n"
-                   f"Subs: {len(subdomains)} | Robots.txt: {'✅' if has_robots else '❌'}\n"
-                   f"Ports: {port_msg}")
-        await msg.edit_text(summary)
+        port_msg = "Cloudflare detected" if ports_result == "CF_DETECTED" else f"{len(ports_result)} Open"
+        await msg.edit_text(f"✅ **Scan Done!**\nTime: {duration}s\nPorts: {port_msg}\nRobots: {'✅' if has_robots else '❌'}")
     
     finally:
         context.user_data["scanning"] = False
 
-# ============== PDF & EXPORT ==============
+# ============== PDF & HANDLERS ==============
 def make_elite_pdf(data, user_id):
-    filename = f"report_{user_id}_{int(time.time())}.pdf" # Collision avoided
+    filename = f"report_{user_id}_{int(time.time())}.pdf"
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Helvetica", "B", 16) # Linux portability
+    pdf.set_font("Helvetica", "B", 16)
     pdf.cell(0, 10, "Elite Recon Audit Report", ln=True, align='C')
     pdf.ln(5)
-
     pdf.set_font("Helvetica", size=10)
-    pdf.cell(0, 10, f"Duration: {data['time']}s | Robots.txt: {'Accessible' if data['robots'] else 'No'}", ln=True)
-    pdf.ln(5)
 
-    if not data['results']: # Empty UX handled
+    if not data['results']:
         pdf.multi_cell(0, 5, "No results found.")
     else:
         for r in data['results']:
@@ -197,7 +176,6 @@ def make_elite_pdf(data, user_id):
     pdf.output(filename)
     return filename
 
-# ============== HANDLERS ==============
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -208,7 +186,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(run_full_scan(update, context))
     elif q.data == "pdf":
         if not context.user_data.get("ready"):
-            await q.message.reply_text("❌ No scan data available.")
+            await q.message.reply_text("❌ Results not ready!")
             return
         fname = await asyncio.get_running_loop().run_in_executor(None, make_elite_pdf, context.user_data["scan_data"], update.effective_user.id)
         with open(fname, "rb") as doc:
@@ -219,16 +197,12 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /target example.com")
         return
-    
-    # Auto-HTTPS Fix
     raw_url = context.args[0].rstrip("/")
-    if not raw_url.startswith(("http://", "https://")):
-        raw_url = "https://" + raw_url
+    if not raw_url.startswith(("http://", "https://")): raw_url = "https://" + raw_url
     
     domain = urlparse(raw_url).netloc
-    # Security: Block Private IPs
     if not domain or domain in ["localhost", "127.0.0.1"] or domain.startswith("192.168"):
-        await update.message.reply_text("❌ Invalid or Private target.")
+        await update.message.reply_text("❌ Private/Invalid targets blocked.")
         return
 
     context.user_data.clear()
@@ -238,7 +212,7 @@ async def set_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🚀 Start Scan", callback_data="scan")],
           [InlineKeyboardButton("📄 Get PDF", callback_data="pdf")]]
-    await update.message.reply_text("🔥 **Elite Recon Bot v14**\nIPv6 preference, absolute safety, and bug-free logic.", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("🛡 **Elite Master v15**\nSafe. Optimized. Final.", reply_markup=InlineKeyboardMarkup(kb))
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
